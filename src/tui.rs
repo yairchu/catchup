@@ -17,6 +17,8 @@ use std::process::Command;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+const MUTED: Color = Color::Rgb(160, 160, 160);
+
 type Key = (usize, usize);
 
 struct App {
@@ -265,7 +267,7 @@ impl App {
             }
             let mut header = vec![Span::from(repo.display.clone()).bold()];
             if let Some(ws) = &target.workspace {
-                header.push(format!("  {}", ws.name).dark_gray());
+                header.push(format!("  {}", ws.name).fg(MUTED));
             }
             if let Some(e) = &repo.error {
                 header.push(format!("  {}", first_line(e)).red());
@@ -285,11 +287,11 @@ impl App {
         }
         if !pending.is_empty() {
             lines.push((Line::from(""), None));
-            lines.push((format!("fetching: {}", pending.join(", ")).dark_gray().into(), None));
+            lines.push((format!("fetching: {}", pending.join(", ")).fg(MUTED).into(), None));
         }
         if !quiet.is_empty() {
             lines.push((Line::from(""), None));
-            lines.push((format!("nothing new: {}", quiet.join(", ")).dark_gray().into(), None));
+            lines.push((format!("nothing new: {}", quiet.join(", ")).fg(MUTED).into(), None));
         }
         lines
     }
@@ -329,16 +331,16 @@ impl App {
         let empty = text.is_empty();
         f.render_widget(Paragraph::new(text).scroll((self.scroll as u16, 0)), list);
         if empty {
-            f.render_widget(Paragraph::new("fetching…".dark_gray()), list);
+            f.render_widget(Paragraph::new("fetching…".fg(MUTED)), list);
         }
 
         self.draw_detail(f, detail);
 
         let keys = "↑↓ select  ⏎ log  w log in its workspace  p pull  P pull all  q quit";
         let footer_text = if self.status.is_empty() {
-            Line::from(keys.dark_gray())
+            Line::from(keys.fg(MUTED))
         } else {
-            Line::from(vec![Span::from(self.status.clone()).yellow(), "   ".into(), keys.dark_gray()])
+            Line::from(vec![Span::from(self.status.clone()).yellow(), "   ".into(), keys.fg(MUTED)])
         };
         f.render_widget(Paragraph::new(footer_text), footer);
     }
@@ -361,7 +363,7 @@ impl App {
             if let Some(l) = branch.local.as_ref().filter(|l| l.behind > 0) {
                 text.push(
                     format!("Nothing new in this fetch; {} commits fetched earlier are not pulled yet.", l.behind)
-                        .dark_gray()
+                        .fg(MUTED)
                         .into(),
                 );
             }
@@ -378,16 +380,16 @@ fn first_line(s: &str) -> &str {
 fn commit_line(c: &scan::Commit) -> Line<'static> {
     let (marker, style) = match c.mine {
         Mine::No => ("  ", Style::new()),
-        Mine::Pushed => ("  ", Style::new().fg(Color::DarkGray)),
+        Mine::Pushed => ("  ", Style::new().fg(MUTED)),
         Mine::Landed => ("★ ", Style::new().fg(Color::Magenta)),
     };
     let mut spans = vec![
         Span::styled(marker, style),
-        Span::styled(format!("{} ", c.short), style.fg(if c.mine == Mine::Pushed { Color::DarkGray } else { Color::Yellow })),
-        Span::styled(format!("{:<16} ", c.author), style.fg(if c.mine == Mine::Pushed { Color::DarkGray } else { Color::Cyan })),
+        Span::styled(format!("{} ", c.short), style.fg(if c.mine == Mine::Pushed { MUTED } else { Color::Yellow })),
+        Span::styled(format!("{:<16} ", c.author), style.fg(if c.mine == Mine::Pushed { MUTED } else { Color::Cyan })),
         Span::styled(c.subject.clone(), style),
     ];
-    spans.push(Span::styled(format!("  {}", c.when), Style::new().fg(Color::DarkGray)));
+    spans.push(Span::styled(format!("  {}", c.when), Style::new().fg(MUTED)));
     Line::from(spans)
 }
 
@@ -416,7 +418,7 @@ fn summary(b: &Branch) -> Vec<Span<'static>> {
     }
     if pushed > 0 {
         sep(&mut spans);
-        spans.push(format!("+{pushed} yours").dark_gray());
+        spans.push(format!("+{pushed} yours").fg(MUTED));
     }
     match &b.local {
         Some(l) if l.behind > 0 && l.ahead > 0 => {
@@ -430,7 +432,7 @@ fn summary(b: &Branch) -> Vec<Span<'static>> {
         Some(_) => {}
         None => {
             sep(&mut spans);
-            spans.push("no local branch".dark_gray());
+            spans.push("no local branch".fg(MUTED));
         }
     }
     if let Some(note) = &b.note {
