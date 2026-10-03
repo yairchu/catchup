@@ -101,7 +101,7 @@ impl App {
                 Action::Foreground(mut cmd) => {
                     stop();
                     if let Err(e) = cmd.status() {
-                        self.status = format!("could not run glog: {e}");
+                        self.status = format!("could not run {:?}: {e}", cmd.get_program());
                     }
                     *terminal = start();
                 }
@@ -161,7 +161,10 @@ impl App {
             self.status = "nothing to show".into();
             return Action::None;
         };
-        let mut program = vec!["glog", "log"];
+        let mut program = match on_path("glog") {
+            true => vec!["glog", "log"],
+            false => vec!["git", "log", "-p"],
+        };
         program.extend(range.iter().map(String::as_str));
         if !in_workspace {
             let mut cmd = Command::new(program[0]);
@@ -177,7 +180,7 @@ impl App {
         let result =
             cmux::new_split(Some(&ws.id), &command).and_then(|_| cmux::select_workspace(&ws.id));
         self.status = match result {
-            Ok(()) => format!("glog log {}", range.join(" ")),
+            Ok(()) => program.join(" "),
             Err(e) => e.to_string(),
         };
         Action::None
@@ -472,4 +475,9 @@ pub fn print(repos: &[Repo]) {
     if !quiet.is_empty() {
         println!("nothing new: {}", quiet.join(", "));
     }
+}
+
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
 }
