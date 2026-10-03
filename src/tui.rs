@@ -25,8 +25,6 @@ struct App {
     targets: Vec<Target>,
     repos: Vec<Option<Repo>>,
     selected: Option<Key>,
-    /// The cmux split showing the last opened log, to replace it on the next one.
-    viewer: Option<String>,
     status: String,
     scroll: usize,
     list_area: Rect,
@@ -46,7 +44,6 @@ pub fn run(targets: Vec<Target>, rx: Receiver<(usize, Repo)>) -> Result<()> {
         repos: targets.iter().map(|_| None).collect(),
         targets,
         selected: None,
-        viewer: None,
         status: String::new(),
         scroll: 0,
         list_area: Rect::default(),
@@ -166,27 +163,19 @@ impl App {
         };
         let mut program = vec!["glog", "log"];
         program.extend(range.iter().map(String::as_str));
-        if !cmux::inside_cmux() {
+        if !in_workspace {
             let mut cmd = Command::new(program[0]);
             cmd.args(&program[1..]).current_dir(&repo.path);
             return Action::Foreground(cmd);
         }
         let command = cmux::shell_command(&repo.path, &program);
         let workspace = self.targets[self.selected.unwrap().0].workspace.clone();
-        let result = match (in_workspace, workspace) {
-            (true, Some(ws)) => cmux::new_split(Some(&ws.id), &command)
-                .and_then(|_| cmux::select_workspace(&ws.id)),
-            (true, None) => {
-                self.status = "this repo is not in a cmux workspace".into();
-                return Action::None;
-            }
-            (false, _) => {
-                if let Some(old) = self.viewer.take() {
-                    cmux::close_surface(&old);
-                }
-                cmux::new_split(None, &command).map(|surface| self.viewer = surface)
-            }
+        let Some(ws) = workspace.filter(|_| cmux::inside_cmux()) else {
+            self.status = "this repo is not in a cmux workspace".into();
+            return Action::None;
         };
+        let result =
+            cmux::new_split(Some(&ws.id), &command).and_then(|_| cmux::select_workspace(&ws.id));
         self.status = match result {
             Ok(()) => format!("glog log {}", range.join(" ")),
             Err(e) => e.to_string(),

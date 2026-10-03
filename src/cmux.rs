@@ -119,23 +119,14 @@ pub fn shell_command(dir: &std::path::Path, program: &[&str]) -> String {
     format!("cd {} && exec {}", shell_quote(&dir.to_string_lossy()), args.join(" "))
 }
 
-/// Opens a split running `command`, returning its surface UUID when cmux reports one.
-pub fn new_split(workspace: Option<&str>, command: &str) -> Result<Option<String>> {
-    let mut args = vec!["new-split", "right", "--id-format", "uuids"];
+/// Opens a split running `command`.
+pub fn new_split(workspace: Option<&str>, command: &str) -> Result<()> {
+    let mut args = vec!["new-split", "right"];
     if let Some(ws) = workspace {
         args.extend(["--workspace", ws]);
     }
     args.extend(["--command", command]);
-    let out = cmux(&args)?;
-    Ok(out
-        .split(|c: char| !(c.is_ascii_hexdigit() || c == '-'))
-        .find(|w| w.len() == 36 && w.matches('-').count() == 4)
-        .map(str::to_string))
-}
-
-pub fn close_surface(uuid: &str) {
-    // The user may have already closed it; nothing to do then.
-    let _ = cmux(&["close-surface", "--surface", uuid]);
+    cmux(&args).map(drop)
 }
 
 pub fn select_workspace(workspace: &str) -> Result<()> {
