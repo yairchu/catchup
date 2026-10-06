@@ -427,6 +427,10 @@ fn summary(b: &Branch) -> Vec<Span<'static>> {
             spans.push("no local branch".fg(MUTED));
         }
     }
+    if let Some(base) = &b.base {
+        sep(&mut spans);
+        spans.push(format!("onto {base}").fg(MUTED));
+    }
     if let Some(note) = &b.note {
         sep(&mut spans);
         spans.push(note.clone().yellow());

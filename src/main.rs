@@ -1,5 +1,6 @@
 mod cmux;
 mod git;
+mod github;
 mod scan;
 mod tui;
 

@@ -1,6 +1,7 @@
 //! What a fetch brought into one repository.
 
 use crate::git::{self, git, query, rev};
+use crate::github;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -34,8 +35,11 @@ pub struct Branch {
     /// Tip before this run's fetch, and after it.
     pub old: Option<String>,
     pub new: Option<String>,
+    /// The branch this one is meant to go into, as in `origin/feature`, when
+    /// its open pull request names one other than the default branch.
+    pub base: Option<String>,
     /// Tips whose history is not new here: the old tip, and for branches
-    /// other than the default one, the default branch.
+    /// other than the default one, their base or else the default branch.
     pub exclude: Vec<String>,
     pub commits: Vec<Commit>,
     /// The fetch moved the branch to something not containing its old tip.
@@ -154,7 +158,17 @@ fn scan_into(repo: &mut Repo, worktrees: &[PathBuf], fetch: bool) -> Result<()> 
     for b in &mut branches {
         b.new = rev(&dir, &b.remote_ref);
     }
-    let default_new = branches.iter().find(|b| b.is_default).and_then(|b| b.new.clone());
+    let default = branches.iter().find(|b| b.is_default);
+    let default_name = default.map(|b| b.name.clone());
+    let default_new = default.and_then(|b| b.new.clone());
+    for b in branches.iter_mut().filter(|b| !b.is_default) {
+        let Some((remote, name)) = b.remote_short().split_once('/') else {
+            continue;
+        };
+        b.base = github::pr_base(&dir, remote, name)
+            .filter(|base| Some(base) != default_name.as_ref())
+            .map(|base| format!("{remote}/{base}"));
+    }
     for b in &mut branches {
         let Some(new) = b.new.clone().filter(|new| b.old.as_ref() != Some(new)) else {
             continue;
@@ -164,7 +178,8 @@ fn scan_into(repo: &mut Repo, worktrees: &[PathBuf], fetch: bool) -> Result<()> 
             b.exclude.push(old.clone());
         }
         if !b.is_default {
-            b.exclude.extend(default_new.clone());
+            let base = b.base.as_ref().and_then(|base| rev(&dir, &format!("refs/remotes/{base}")));
+            b.exclude.extend(base.or_else(|| default_new.clone()));
         }
         let mut revs = vec![new];
         revs.extend(b.exclude.iter().map(|e| format!("^{e}")));
@@ -215,6 +230,7 @@ fn watched_branches(dir: &Path, worktrees: &[PathBuf]) -> Vec<Branch> {
             is_default,
             old: None,
             new: None,
+            base: None,
             exclude: Vec::new(),
             commits: Vec::new(),
             rewritten: false,
