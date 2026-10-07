@@ -162,7 +162,7 @@ impl App {
             return Action::None;
         };
         let mut program = match on_path("glog") {
-            true => vec!["glog", "log"],
+            true => vec!["glog", "log", "--exit-on-esc"],
             false => vec!["git", "log", "-p"],
         };
         program.extend(range.iter().map(String::as_str));
