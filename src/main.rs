@@ -66,9 +66,8 @@ fn main() -> Result<()> {
             let _ = tx.send((i, scan::scan(&worktrees, fetch)));
         });
     }
-    drop(tx);
-
     if print {
+        drop(tx);
         let mut repos: Vec<Option<scan::Repo>> = targets.iter().map(|_| None).collect();
         for (i, repo) in rx {
             repos[i] = Some(repo);
@@ -76,7 +75,7 @@ fn main() -> Result<()> {
         tui::print(&repos.into_iter().flatten().collect::<Vec<_>>());
         Ok(())
     } else {
-        tui::run(targets, rx)
+        tui::run(targets, fetch, tx, rx)
     }
 }
 

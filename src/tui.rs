@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 const MUTED: Color = Color::Rgb(160, 160, 160);
@@ -28,6 +28,11 @@ struct App {
     status: String,
     scroll: usize,
     list_area: Rect,
+    refresh_area: Rect,
+    fetch: bool,
+    tx: Sender<(usize, Repo)>,
+    pending: Vec<bool>,
+    refreshing: bool,
     /// Which entry each line of the list shows, as last drawn.
     line_keys: Vec<Option<Key>>,
 }
@@ -39,16 +44,13 @@ enum Action {
     Foreground(Command),
 }
 
-pub fn run(targets: Vec<Target>, rx: Receiver<(usize, Repo)>) -> Result<()> {
-    let mut app = App {
-        repos: targets.iter().map(|_| None).collect(),
-        targets,
-        selected: None,
-        status: String::new(),
-        scroll: 0,
-        list_area: Rect::default(),
-        line_keys: Vec::new(),
-    };
+pub fn run(
+    targets: Vec<Target>,
+    fetch: bool,
+    tx: Sender<(usize, Repo)>,
+    rx: Receiver<(usize, Repo)>,
+) -> Result<()> {
+    let mut app = App::new(targets, fetch, tx);
     let mut terminal = start();
     let result = app.event_loop(&mut terminal, &rx);
     stop();
@@ -67,10 +69,86 @@ fn stop() {
 }
 
 impl App {
+    fn new(targets: Vec<Target>, fetch: bool, tx: Sender<(usize, Repo)>) -> Self {
+        Self {
+            repos: targets.iter().map(|_| None).collect(),
+            pending: targets.iter().map(|_| true).collect(),
+            targets,
+            fetch,
+            tx,
+            refreshing: false,
+            selected: None,
+            status: String::new(),
+            scroll: 0,
+            list_area: Rect::default(),
+            refresh_area: Rect::default(),
+            line_keys: Vec::new(),
+        }
+    }
+
+    fn refresh(&mut self) {
+        if self.pending.iter().any(|pending| *pending) {
+            self.status = "refresh already in progress".into();
+            return;
+        }
+        self.refreshing = true;
+        self.status = if self.fetch {
+            "refreshing…"
+        } else {
+            "refreshing (no fetch)…"
+        }
+        .into();
+        for (i, target) in self.targets.iter().enumerate() {
+            self.pending[i] = true;
+            let repo = self.repos[i].clone();
+            let worktrees = target.worktrees.clone();
+            let tx = self.tx.clone();
+            let fetch = self.fetch;
+            std::thread::spawn(move || {
+                let repo = match repo {
+                    Some(repo) => scan::refresh(repo, &worktrees, fetch),
+                    None => scan::scan(&worktrees, fetch),
+                };
+                let _ = tx.send((i, repo));
+            });
+        }
+    }
+
+    fn receive(&mut self, i: usize, repo: Repo) {
+        // Branch order can change when a worktree switches branches.
+        if let Some((r, b)) = self.selected.filter(|(r, _)| *r == i) {
+            self.selected = self.repos[r]
+                .as_ref()
+                .and_then(|old| old.branches.get(b))
+                .and_then(|old| {
+                    repo.branches.iter().position(|branch| {
+                        branch.name == old.name && branch.remote_ref == old.remote_ref
+                    })
+                })
+                .map(|b| (r, b));
+        }
+        self.repos[i] = Some(repo);
+        self.pending[i] = false;
+        if self.refreshing && !self.pending.iter().any(|pending| *pending) {
+            self.refreshing = false;
+            let failed = self
+                .repos
+                .iter()
+                .flatten()
+                .filter(|repo| repo.error.is_some())
+                .count();
+            self.status = if failed == 0 {
+                "refreshed".into()
+            } else {
+                format!("refreshed; {failed} with errors")
+            };
+        }
+    }
+
     fn event_loop(&mut self, terminal: &mut DefaultTerminal, rx: &Receiver<(usize, Repo)>) -> Result<()> {
         loop {
             while let Ok((i, repo)) = rx.try_recv() {
-                self.repos[i] = Some(repo);
+                self.receive(i, repo);
             }
             if self.selected.is_none_or(|k| !self.entries().contains(&k)) {
                 self.selected = self.entries().first().copied();
@@ -118,12 +196,17 @@ impl App {
             KeyCode::Char('w') => return self.open(true),
             KeyCode::Char('p') => self.pull_selected(),
             KeyCode::Char('P') => self.pull_all(),
+            KeyCode::Char('r') => self.refresh(),
             _ => {}
         }
         Action::None
     }
 
     fn on_click(&mut self, column: u16, row: u16) -> Action {
+        if self.refresh_area.contains((column, row).into()) {
+            self.refresh();
+            return Action::None;
+        }
         let a = self.list_area;
         if column < a.x || column >= a.x + a.width || row < a.y || row >= a.y + a.height {
             return Action::None;
@@ -187,6 +270,9 @@ impl App {
     }
 
     fn pull(&mut self, (r, b): Key) -> Option<Result<String>> {
+        if self.pending[r] {
+            return Some(Err(anyhow::anyhow!("repo is refreshing; wait before pulling")));
+        }
         let repo = self.repos[r].as_mut()?;
         let result = scan::pull(&repo.path, repo.branches.get(b)?);
         repo.branches[b].note = Some(match &result {
@@ -208,6 +294,10 @@ impl App {
     }
 
     fn pull_all(&mut self) {
+        if self.pending.iter().any(|pending| *pending) {
+            self.status = "wait for fetching to finish before pulling all".into();
+            return;
+        }
         let behind: Vec<(Key, usize)> = self
             .entries()
             .into_iter()
@@ -246,8 +336,10 @@ impl App {
         let mut pending = Vec::new();
         let mut quiet = Vec::new();
         for (r, target) in self.targets.iter().enumerate() {
-            let Some(repo) = &self.repos[r] else {
+            if self.pending[r] {
                 pending.push(scan::display_path(&target.worktrees[0]));
+            }
+            let Some(repo) = &self.repos[r] else {
                 continue;
             };
             let shown: Vec<usize> = (0..repo.branches.len())
@@ -279,7 +371,8 @@ impl App {
         }
         if !pending.is_empty() {
             lines.push((Line::from(""), None));
-            lines.push((format!("fetching: {}", pending.join(", ")).fg(MUTED).into(), None));
+            let verb = if self.fetch { "fetching" } else { "scanning" };
+            lines.push((format!("{verb}: {}", pending.join(", ")).fg(MUTED).into(), None));
         }
         if !quiet.is_empty() {
             lines.push((Line::from(""), None));
@@ -328,6 +421,14 @@ impl App {
 
         self.draw_detail(f, detail);
 
+        let [refresh, footer] = Layout::horizontal([Constraint::Length(11), Constraint::Min(0)]).areas(footer);
+        self.refresh_area = refresh;
+        let style = if self.pending.iter().any(|pending| *pending) {
+            Style::new().fg(MUTED)
+        } else {
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED)
+        };
+        f.render_widget(Paragraph::new(Span::styled("r Refresh", style)), refresh);
         let keys = "↑↓ select  ⏎ log  w log in its workspace  p pull  P pull all  q quit";
         let footer_text = if self.status.is_empty() {
             Line::from(keys.fg(MUTED))
@@ -349,7 +450,7 @@ impl App {
             text.push(note.clone().yellow().into());
         }
         if branch.rewritten {
-            text.push("Force-pushed: these are the commits not in the previous tip.".red().into());
+            text.push("Force-pushed: showing commits new since catchup opened.".red().into());
         }
         if branch.commits.is_empty() {
             if let Some(l) = branch.local.as_ref().filter(|l| l.behind > 0) {
@@ -484,4 +585,93 @@ pub fn print(repos: &[Repo]) {
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::{path::PathBuf, sync::mpsc};
+
+    fn branch(name: &str) -> Branch {
+        Branch {
+            name: name.into(),
+            remote_ref: format!("refs/remotes/origin/{name}"),
+            is_default: name == "main",
+            old: None,
+            new: None,
+            base: None,
+            exclude: Vec::new(),
+            commits: Vec::new(),
+            rewritten: true,
+            local: None,
+            note: None,
+        }
+    }
+
+    fn repo(names: &[&str]) -> Repo {
+        Repo {
+            // A nonexistent path makes the refresh worker return a scan error
+            // without contacting a remote or changing a real repository.
+            path: PathBuf::from("/dev/null/catchup-test"),
+            display: "test repo".into(),
+            branches: names.iter().map(|name| branch(name)).collect(),
+            error: None,
+        }
+    }
+
+    fn app() -> (App, Receiver<(usize, Repo)>) {
+        let (tx, rx) = mpsc::channel();
+        let target = Target {
+            worktrees: vec![repo(&[]).path],
+            workspace: None,
+        };
+        (App::new(vec![target], true, tx), rx)
+    }
+
+    #[test]
+    fn refresh_keeps_selected_branch_when_branch_order_changes() {
+        let (mut app, _) = app();
+        app.receive(0, repo(&["main", "feature"]));
+        app.selected = Some((0, 1));
+        app.receive(0, repo(&["feature", "main"]));
+        assert_eq!(app.selected, Some((0, 0)));
+        assert_eq!(app.branch(app.selected.unwrap()).unwrap().1.name, "feature");
+        app.receive(0, repo(&["main"]));
+        assert!(app.selected.is_none());
+    }
+
+    #[test]
+    fn footer_click_refreshes_in_background_and_prevents_overlapping_operations() {
+        let (mut app, rx) = app();
+        app.on_key(KeyCode::Char('r'));
+        assert!(rx.try_recv().is_err(), "wait for the initial scan");
+        app.receive(0, repo(&["main"]));
+        app.selected = Some((0, 0));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 24)].symbol(), "r");
+        let button = app.refresh_area;
+        app.on_click(button.x, button.y);
+        assert!(app.refreshing);
+        assert!(app.pending[0]);
+        assert_eq!(app.entries(), vec![(0, 0)], "keep existing entries usable");
+        app.on_key(KeyCode::Char('r'));
+        assert_eq!(app.status, "refresh already in progress");
+        assert!(
+            app.pull((0, 0)).unwrap().is_err(),
+            "wait before pulling a refreshing repo"
+        );
+        let (i, repo) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.receive(i, repo);
+        assert!(!app.refreshing);
+        assert!(!app.pending[0]);
+        assert_eq!(app.selected, Some((0, 0)));
+        assert_eq!(app.status, "refreshed; 1 with errors");
+        assert!(
+            rx.try_recv().is_err(),
+            "repeated refresh must not spawn another worker"
+        );
+    }
 }

@@ -32,7 +32,7 @@ pub struct Branch {
     /// Remote-tracking ref, e.g. `refs/remotes/origin/main`.
     pub remote_ref: String,
     pub is_default: bool,
-    /// Tip before this run's fetch, and after it.
+    /// Tip when first watched in this session, and after the latest fetch.
     pub old: Option<String>,
     pub new: Option<String>,
     /// The branch this one is meant to go into, as in `origin/feature`, when
@@ -42,7 +42,7 @@ pub struct Branch {
     /// other than the default one, their base or else the default branch.
     pub exclude: Vec<String>,
     pub commits: Vec<Commit>,
-    /// The fetch moved the branch to something not containing its old tip.
+    /// A fetch in this session moved the branch to a non-descendant tip.
     pub rewritten: bool,
     pub local: Option<Local>,
     /// Outcome of the last pull attempt.
@@ -90,6 +90,7 @@ fn short(sha: &str) -> &str {
     &sha[..sha.len().min(10)]
 }
 
+#[derive(Clone)]
 pub struct Repo {
     pub path: PathBuf,
     pub display: String,
@@ -124,20 +125,34 @@ pub fn scan(worktrees: &[PathBuf], fetch: bool) -> Repo {
         branches: Vec::new(),
         error: None,
     };
-    if let Err(e) = scan_into(&mut repo, worktrees, fetch) {
+    if let Err(e) = scan_into(&mut repo, worktrees, fetch, &[]) {
         repo.error = Some(e.to_string());
     }
     repo
 }
 
-fn scan_into(repo: &mut Repo, worktrees: &[PathBuf], fetch: bool) -> Result<()> {
+/// Fetch again, comparing with the original snapshot so earlier discoveries
+/// remain visible. Keep the previous results if scanning fails.
+pub fn refresh(mut repo: Repo, worktrees: &[PathBuf], fetch: bool) -> Repo {
+    let previous = repo.branches.clone();
+    repo.error = None;
+    if let Err(e) = scan_into(&mut repo, worktrees, fetch, &previous) {
+        repo.error = Some(e.to_string());
+    }
+    repo
+}
+
+fn scan_into(repo: &mut Repo, worktrees: &[PathBuf], fetch: bool, previous: &[Branch]) -> Result<()> {
     let dir = repo.path.clone();
     let mut branches = watched_branches(&dir, worktrees);
     if branches.is_empty() {
         anyhow::bail!("no remote branch to follow");
     }
     for b in &mut branches {
-        b.old = rev(&dir, &b.remote_ref);
+        b.old = match previous.iter().find(|old| old.remote_ref == b.remote_ref) {
+            Some(old) => old.old.clone(),
+            None => rev(&dir, &b.remote_ref),
+        };
     }
     if fetch {
         let mut remotes: Vec<&str> = branches
@@ -170,11 +185,16 @@ fn scan_into(repo: &mut Repo, worktrees: &[PathBuf], fetch: bool) -> Result<()> 
             .map(|base| format!("{remote}/{base}"));
     }
     for b in &mut branches {
+        let previous = previous.iter().find(|old| old.remote_ref == b.remote_ref);
+        let last_tip = previous.and_then(|old| old.new.as_ref()).or(b.old.as_ref());
+        b.rewritten = previous.is_some_and(|old| old.rewritten)
+            || last_tip.zip(b.new.as_ref()).is_some_and(|(old, new)| {
+                old != new && !git::is_ancestor(&dir, old, new)
+            });
         let Some(new) = b.new.clone().filter(|new| b.old.as_ref() != Some(new)) else {
             continue;
         };
         if let Some(old) = &b.old {
-            b.rewritten = !git::is_ancestor(&dir, old, &new);
             b.exclude.push(old.clone());
         }
         if !b.is_default {
@@ -326,4 +346,141 @@ pub fn pull(dir: &Path, b: &Branch) -> Result<String> {
         )?,
     };
     Ok(format!("pulled {}", local.behind))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Sandbox(PathBuf);
+
+    impl Sandbox {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("catchup-test-{}-{unique}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn commit(dir: &Path, subject: &str) {
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=Catchup Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                subject,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn refresh_preserves_session_history_and_handles_rewrites_and_errors() {
+        let sandbox = Sandbox::new();
+        let producer = sandbox.0.join("producer");
+        let consumer = sandbox.0.join("consumer");
+        git(
+            &sandbox.0,
+            &["init", "--initial-branch=main", producer.to_str().unwrap()],
+        )
+        .unwrap();
+        commit(&producer, "baseline");
+        let baseline = rev(&producer, "HEAD").unwrap();
+        git(
+            &sandbox.0,
+            &[
+                "clone",
+                producer.to_str().unwrap(),
+                consumer.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let worktrees = [consumer.clone()];
+
+        commit(&producer, "first discovery");
+        let repo = scan(&worktrees, true);
+        assert!(repo.error.is_none(), "{:?}", repo.error);
+        assert_eq!(repo.branches[0].commits[0].subject, "first discovery");
+
+        commit(&producer, "second discovery");
+        let repo = refresh(repo, &worktrees, true);
+        assert!(repo.error.is_none(), "{:?}", repo.error);
+        assert_eq!(repo.branches[0].commits.len(), 2);
+        assert_eq!(repo.branches[0].old.as_ref(), Some(&baseline));
+        assert_eq!(repo.branches[0].local.as_ref().unwrap().behind, 2);
+        let range = repo.branches[0].log_range().unwrap();
+        assert_eq!(
+            git(&consumer, &["rev-list", "--count", &range[0]]).unwrap(),
+            "2"
+        );
+
+        let repo = refresh(repo, &worktrees, true);
+        assert_eq!(
+            repo.branches[0].commits.len(),
+            2,
+            "an unchanged refresh keeps discoveries"
+        );
+        commit(&producer, "third discovery");
+        let repo = refresh(repo, &worktrees, false);
+        assert_eq!(
+            repo.branches[0].commits.len(),
+            2,
+            "no-fetch must not contact the remote"
+        );
+        let repo = refresh(repo, &worktrees, true);
+        assert_eq!(repo.branches[0].commits.len(), 3);
+
+        // The rewrite still descends from the session baseline, but replaces
+        // commits discovered by previous fetches.
+        git(&producer, &["reset", "--hard", &baseline]).unwrap();
+        commit(&producer, "replacement");
+        let repo = refresh(repo, &worktrees, true);
+        assert!(repo.branches[0].rewritten);
+        assert_eq!(repo.branches[0].commits.len(), 1);
+        assert_eq!(repo.branches[0].commits[0].subject, "replacement");
+        let repo = refresh(repo, &worktrees, true);
+        assert!(repo.branches[0].rewritten, "keep the force-push warning");
+
+        git(
+            &consumer,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                sandbox.0.join("missing").to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let repo = refresh(repo, &worktrees, true);
+        assert!(repo.error.is_some());
+        assert_eq!(repo.branches[0].commits[0].subject, "replacement");
+        git(
+            &consumer,
+            &["remote", "set-url", "origin", producer.to_str().unwrap()],
+        )
+        .unwrap();
+        let repo = refresh(repo, &worktrees, true);
+        assert!(
+            repo.error.is_none(),
+            "a successful refresh clears fetch errors"
+        );
+    }
 }
