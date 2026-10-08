@@ -328,10 +328,10 @@ impl App {
 
     /// Selectable entries, in display order.
     fn entries(&self) -> Vec<Key> {
-        self.lines().into_iter().filter_map(|(_, k)| k).collect()
+        self.lines(self.list_area.width).into_iter().filter_map(|(_, k)| k).collect()
     }
 
-    fn lines(&self) -> Vec<(Line<'static>, Option<Key>)> {
+    fn lines(&self, width: u16) -> Vec<(Line<'static>, Option<Key>)> {
         let mut lines = Vec::new();
         let mut pending = Vec::new();
         let mut quiet = Vec::new();
@@ -376,7 +376,12 @@ impl App {
         }
         if !quiet.is_empty() {
             lines.push((Line::from(""), None));
-            lines.push((format!("nothing new: {}", quiet.join(", ")).fg(MUTED).into(), None));
+            let summary = format!("nothing new: {}", quiet.join(", "));
+            lines.extend(
+                textwrap::wrap(&summary, usize::from(width.max(1)))
+                    .into_iter()
+                    .map(|line| (line.into_owned().fg(MUTED).into(), None)),
+            );
         }
         lines
     }
@@ -390,7 +395,7 @@ impl App {
         .areas(f.area());
         self.list_area = list;
 
-        let lines = self.lines();
+        let lines = self.lines(list.width);
         let selected_line = lines.iter().position(|(_, k)| k.is_some() && *k == self.selected);
         if let Some(sel) = selected_line {
             let height = list.height as usize;
@@ -627,6 +632,32 @@ mod tests {
             workspace: None,
         };
         (App::new(vec![target], true, tx), rx)
+    }
+
+    #[test]
+    fn quiet_summary_wraps_and_reflows_on_resize() {
+        let (mut app, _) = app();
+        let mut quiet = repo(&[]);
+        quiet.display = "~/one, ~/two, ~/three".into();
+        app.receive(0, quiet);
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let row = |terminal: &Terminal<TestBackend>, y| {
+            (0..terminal.size().unwrap().width)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        };
+        assert_eq!(row(&terminal, 1), "nothing new: ~/one,");
+        assert_eq!(row(&terminal, 2), "~/two, ~/three");
+        assert!(app.line_keys.iter().all(Option::is_none));
+
+        terminal.backend_mut().resize(40, 20);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(row(&terminal, 1), "nothing new: ~/one, ~/two, ~/three");
+        assert_eq!(row(&terminal, 2), "");
     }
 
     #[test]
