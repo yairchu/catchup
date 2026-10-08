@@ -32,7 +32,7 @@ pub struct Branch {
     /// Remote-tracking ref, e.g. `refs/remotes/origin/main`.
     pub remote_ref: String,
     pub is_default: bool,
-    /// Tip when first watched in this session, and after the latest fetch.
+    /// Tips before and after this fetch.
     pub old: Option<String>,
     pub new: Option<String>,
     /// The branch this one is meant to go into, as in `origin/feature`, when
@@ -42,7 +42,7 @@ pub struct Branch {
     /// other than the default one, their base or else the default branch.
     pub exclude: Vec<String>,
     pub commits: Vec<Commit>,
-    /// A fetch in this session moved the branch to a non-descendant tip.
+    /// This fetch moved the branch to a non-descendant tip.
     pub rewritten: bool,
     pub local: Option<Local>,
     /// Outcome of the last pull attempt.
@@ -125,34 +125,20 @@ pub fn scan(worktrees: &[PathBuf], fetch: bool) -> Repo {
         branches: Vec::new(),
         error: None,
     };
-    if let Err(e) = scan_into(&mut repo, worktrees, fetch, &[]) {
+    if let Err(e) = scan_into(&mut repo, worktrees, fetch) {
         repo.error = Some(e.to_string());
     }
     repo
 }
 
-/// Fetch again, comparing with the original snapshot so earlier discoveries
-/// remain visible. Keep the previous results if scanning fails.
-pub fn refresh(mut repo: Repo, worktrees: &[PathBuf], fetch: bool) -> Repo {
-    let previous = repo.branches.clone();
-    repo.error = None;
-    if let Err(e) = scan_into(&mut repo, worktrees, fetch, &previous) {
-        repo.error = Some(e.to_string());
-    }
-    repo
-}
-
-fn scan_into(repo: &mut Repo, worktrees: &[PathBuf], fetch: bool, previous: &[Branch]) -> Result<()> {
+fn scan_into(repo: &mut Repo, worktrees: &[PathBuf], fetch: bool) -> Result<()> {
     let dir = repo.path.clone();
     let mut branches = watched_branches(&dir, worktrees);
     if branches.is_empty() {
         anyhow::bail!("no remote branch to follow");
     }
     for b in &mut branches {
-        b.old = match previous.iter().find(|old| old.remote_ref == b.remote_ref) {
-            Some(old) => old.old.clone(),
-            None => rev(&dir, &b.remote_ref),
-        };
+        b.old = rev(&dir, &b.remote_ref);
     }
     if fetch {
         let mut remotes: Vec<&str> = branches
@@ -185,12 +171,9 @@ fn scan_into(repo: &mut Repo, worktrees: &[PathBuf], fetch: bool, previous: &[Br
             .map(|base| format!("{remote}/{base}"));
     }
     for b in &mut branches {
-        let previous = previous.iter().find(|old| old.remote_ref == b.remote_ref);
-        let last_tip = previous.and_then(|old| old.new.as_ref()).or(b.old.as_ref());
-        b.rewritten = previous.is_some_and(|old| old.rewritten)
-            || last_tip.zip(b.new.as_ref()).is_some_and(|(old, new)| {
-                old != new && !git::is_ancestor(&dir, old, new)
-            });
+        b.rewritten = b.old.as_ref().zip(b.new.as_ref()).is_some_and(|(old, new)| {
+            old != new && !git::is_ancestor(&dir, old, new)
+        });
         let Some(new) = b.new.clone().filter(|new| b.old.as_ref() != Some(new)) else {
             continue;
         };
@@ -393,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_preserves_session_history_and_handles_rewrites_and_errors() {
+    fn rescanning_uses_current_refs_and_handles_rewrites_and_errors() {
         let sandbox = Sandbox::new();
         let producer = sandbox.0.join("producer");
         let consumer = sandbox.0.join("consumer");
@@ -420,44 +403,63 @@ mod tests {
         assert!(repo.error.is_none(), "{:?}", repo.error);
         assert_eq!(repo.branches[0].commits[0].subject, "first discovery");
 
+        let first_tip = repo.branches[0].new.clone();
         commit(&producer, "second discovery");
-        let repo = refresh(repo, &worktrees, true);
+        let repo = scan(&worktrees, true);
         assert!(repo.error.is_none(), "{:?}", repo.error);
-        assert_eq!(repo.branches[0].commits.len(), 2);
-        assert_eq!(repo.branches[0].old.as_ref(), Some(&baseline));
+        assert_eq!(repo.branches[0].commits.len(), 1);
+        assert_eq!(repo.branches[0].commits[0].subject, "second discovery");
+        assert_eq!(repo.branches[0].old, first_tip);
         assert_eq!(repo.branches[0].local.as_ref().unwrap().behind, 2);
         let range = repo.branches[0].log_range().unwrap();
+        assert_eq!(
+            git(&consumer, &["rev-list", "--count", &range[0]]).unwrap(),
+            "1"
+        );
+
+        let repo = scan(&worktrees, true);
+        let branch = &repo.branches[0];
+        assert!(
+            branch.commits.is_empty(),
+            "an unchanged refresh has no discoveries"
+        );
+        assert!(branch.interesting(), "unpulled commits remain visible");
+        let range = branch.log_range().unwrap();
         assert_eq!(
             git(&consumer, &["rev-list", "--count", &range[0]]).unwrap(),
             "2"
         );
 
-        let repo = refresh(repo, &worktrees, true);
-        assert_eq!(
-            repo.branches[0].commits.len(),
-            2,
-            "an unchanged refresh keeps discoveries"
-        );
+        // Pulling outside catchup acknowledges those commits on the next scan.
+        git(&consumer, &["merge", "--ff-only", "origin/main"]).unwrap();
+        let repo = scan(&worktrees, true);
+        assert!(!repo.branches[0].interesting());
+        assert!(repo.branches[0].log_range().is_none());
+
         commit(&producer, "third discovery");
-        let repo = refresh(repo, &worktrees, false);
-        assert_eq!(
-            repo.branches[0].commits.len(),
-            2,
+        let repo = scan(&worktrees, false);
+        assert!(
+            !repo.branches[0].interesting(),
             "no-fetch must not contact the remote"
         );
-        let repo = refresh(repo, &worktrees, true);
-        assert_eq!(repo.branches[0].commits.len(), 3);
+        let repo = scan(&worktrees, true);
+        assert_eq!(repo.branches[0].commits.len(), 1);
+        assert_eq!(repo.branches[0].commits[0].subject, "third discovery");
 
-        // The rewrite still descends from the session baseline, but replaces
-        // commits discovered by previous fetches.
+        // Only the scan that discovers a rewrite shows the warning.
         git(&producer, &["reset", "--hard", &baseline]).unwrap();
         commit(&producer, "replacement");
-        let repo = refresh(repo, &worktrees, true);
+        let repo = scan(&worktrees, true);
         assert!(repo.branches[0].rewritten);
         assert_eq!(repo.branches[0].commits.len(), 1);
         assert_eq!(repo.branches[0].commits[0].subject, "replacement");
-        let repo = refresh(repo, &worktrees, true);
-        assert!(repo.branches[0].rewritten, "keep the force-push warning");
+        let repo = scan(&worktrees, true);
+        assert!(!repo.branches[0].rewritten);
+        assert!(repo.branches[0].commits.is_empty());
+        assert!(
+            repo.branches[0].interesting(),
+            "diverged branches remain visible"
+        );
 
         git(
             &consumer,
@@ -469,15 +471,16 @@ mod tests {
             ],
         )
         .unwrap();
-        let repo = refresh(repo, &worktrees, true);
+        let repo = scan(&worktrees, true);
         assert!(repo.error.is_some());
-        assert_eq!(repo.branches[0].commits[0].subject, "replacement");
+        assert!(repo.branches[0].commits.is_empty());
+        assert!(repo.branches[0].interesting());
         git(
             &consumer,
             &["remote", "set-url", "origin", producer.to_str().unwrap()],
         )
         .unwrap();
-        let repo = refresh(repo, &worktrees, true);
+        let repo = scan(&worktrees, true);
         assert!(
             repo.error.is_none(),
             "a successful refresh clears fetch errors"

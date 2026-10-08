@@ -100,15 +100,11 @@ impl App {
         .into();
         for (i, target) in self.targets.iter().enumerate() {
             self.pending[i] = true;
-            let repo = self.repos[i].clone();
             let worktrees = target.worktrees.clone();
             let tx = self.tx.clone();
             let fetch = self.fetch;
             std::thread::spawn(move || {
-                let repo = match repo {
-                    Some(repo) => scan::refresh(repo, &worktrees, fetch),
-                    None => scan::scan(&worktrees, fetch),
-                };
+                let repo = scan::scan(&worktrees, fetch);
                 let _ = tx.send((i, repo));
             });
         }
@@ -455,7 +451,7 @@ impl App {
             text.push(note.clone().yellow().into());
         }
         if branch.rewritten {
-            text.push("Force-pushed: showing commits new since catchup opened.".red().into());
+            text.push("Force-pushed: showing commits new in this fetch.".red().into());
         }
         if branch.commits.is_empty() {
             if let Some(l) = branch.local.as_ref().filter(|l| l.behind > 0) {
@@ -698,7 +694,7 @@ mod tests {
         app.receive(i, repo);
         assert!(!app.refreshing);
         assert!(!app.pending[0]);
-        assert_eq!(app.selected, Some((0, 0)));
+        assert_eq!(app.selected, None, "a failed fresh scan has no branches");
         assert_eq!(app.status, "refreshed; 1 with errors");
         assert!(
             rx.try_recv().is_err(),

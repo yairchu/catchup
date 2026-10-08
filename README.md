@@ -31,9 +31,10 @@ catchup --no-fetch  # skip fetching, only show what can be pulled
 | `r` / Refresh     | refresh all listed repos                     |
 | `q`               | quit                                         |
 
-Refresh runs in the background and keeps commits discovered since catchup
-opened visible. With `--no-fetch`, it rescans without fetching. Click Refresh
-in the footer or press `r`; wait for a repo's refresh to finish before pulling it.
+Refresh runs in the background and shows newly fetched commits and anything
+still waiting to be pulled. With `--no-fetch`, it rescans without fetching.
+Click Refresh in the footer or press `r`; wait for a repo's refresh to finish
+before pulling it.
 
 ## License
 
