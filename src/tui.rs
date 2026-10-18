@@ -7,6 +7,7 @@ use crossterm::event::{
     MouseButton, MouseEventKind,
 };
 use crossterm::execute;
+use crossterm::terminal::SetTitle;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -59,7 +60,7 @@ pub fn run(
 
 fn start() -> DefaultTerminal {
     let terminal = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    let _ = execute!(std::io::stdout(), EnableMouseCapture, SetTitle("catchup"));
     terminal
 }
 
@@ -383,12 +384,14 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
-        let [list, detail, footer] = Layout::vertical([
+        let [title, list, detail, footer] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Min(5),
             Constraint::Percentage(45),
             Constraint::Length(1),
         ])
         .areas(f.area());
+        f.render_widget(Paragraph::new("catchup".bold().cyan()), title);
         self.list_area = list;
 
         let lines = self.lines(list.width);
@@ -646,14 +649,14 @@ mod tests {
                 .trim_end()
                 .to_owned()
         };
-        assert_eq!(row(&terminal, 1), "nothing new: ~/one,");
-        assert_eq!(row(&terminal, 2), "~/two, ~/three");
+        assert_eq!(row(&terminal, 2), "nothing new: ~/one,");
+        assert_eq!(row(&terminal, 3), "~/two, ~/three");
         assert!(app.line_keys.iter().all(Option::is_none));
 
         terminal.backend_mut().resize(40, 20);
         terminal.draw(|frame| app.draw(frame)).unwrap();
-        assert_eq!(row(&terminal, 1), "nothing new: ~/one, ~/two, ~/three");
-        assert_eq!(row(&terminal, 2), "");
+        assert_eq!(row(&terminal, 2), "nothing new: ~/one, ~/two, ~/three");
+        assert_eq!(row(&terminal, 3), "");
     }
 
     #[test]
