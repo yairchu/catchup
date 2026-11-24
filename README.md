@@ -32,7 +32,9 @@ catchup --no-fetch  # skip fetching, only show what can be pulled
 | `q`               | quit                                         |
 
 Refresh runs in the background and shows newly fetched commits and anything
-still waiting to be pulled. With `--no-fetch`, it rescans without fetching.
+still waiting to be pulled. If you started Catchup without directories, refresh
+also adds repositories opened in cmux since the last scan. With `--no-fetch`,
+it rescans without fetching.
 Click Refresh in the footer or press `r`; wait for a repo's refresh to finish
 before pulling it.
 

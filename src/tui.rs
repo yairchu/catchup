@@ -34,6 +34,9 @@ struct App {
     tx: Sender<(usize, Repo)>,
     pending: Vec<bool>,
     refreshing: bool,
+    discover_cmux: bool,
+    discovery: Option<Receiver<Result<Vec<Target>>>>,
+    discovery_error: Option<String>,
     /// Which entry each line of the list shows, as last drawn.
     line_keys: Vec<Option<Key>>,
 }
@@ -48,10 +51,11 @@ enum Action {
 pub fn run(
     targets: Vec<Target>,
     fetch: bool,
+    discover_cmux: bool,
     tx: Sender<(usize, Repo)>,
     rx: Receiver<(usize, Repo)>,
 ) -> Result<()> {
-    let mut app = App::new(targets, fetch, tx);
+    let mut app = App::new(targets, fetch, discover_cmux, tx);
     let mut terminal = start();
     let result = app.event_loop(&mut terminal, &rx);
     stop();
@@ -70,7 +74,12 @@ fn stop() {
 }
 
 impl App {
-    fn new(targets: Vec<Target>, fetch: bool, tx: Sender<(usize, Repo)>) -> Self {
+    fn new(
+        targets: Vec<Target>,
+        fetch: bool,
+        discover_cmux: bool,
+        tx: Sender<(usize, Repo)>,
+    ) -> Self {
         Self {
             repos: targets.iter().map(|_| None).collect(),
             pending: targets.iter().map(|_| true).collect(),
@@ -78,6 +87,9 @@ impl App {
             fetch,
             tx,
             refreshing: false,
+            discover_cmux,
+            discovery: None,
+            discovery_error: None,
             selected: None,
             status: String::new(),
             scroll: 0,
@@ -88,7 +100,7 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        if self.pending.iter().any(|pending| *pending) {
+        if self.refreshing || self.pending.iter().any(|pending| *pending) {
             self.status = "refresh already in progress".into();
             return;
         }
@@ -99,6 +111,44 @@ impl App {
             "refreshing (no fetch)…"
         }
         .into();
+        self.discovery_error = None;
+        if self.discover_cmux {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.discovery = Some(rx);
+            self.pending.fill(true);
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::cmux_targets());
+            });
+        } else {
+            self.scan_targets();
+        }
+    }
+
+    fn finish_discovery(&mut self, result: Result<Vec<Target>>) {
+        self.discovery = None;
+        match result {
+            Ok(targets) => {
+                for target in targets {
+                    if let Some(existing) = self
+                        .targets
+                        .iter_mut()
+                        .find(|existing| existing.common_dir == target.common_dir)
+                    {
+                        existing.worktrees = target.worktrees;
+                        existing.workspace = target.workspace;
+                    } else {
+                        self.targets.push(target);
+                        self.repos.push(None);
+                        self.pending.push(true);
+                    }
+                }
+            }
+            Err(error) => self.discovery_error = Some(format!("{error:#}")),
+        }
+        self.scan_targets();
+    }
+
+    fn scan_targets(&mut self) {
         for (i, target) in self.targets.iter().enumerate() {
             self.pending[i] = true;
             let worktrees = target.worktrees.clone();
@@ -139,11 +189,23 @@ impl App {
             } else {
                 format!("refreshed; {failed} with errors")
             };
+            if let Some(error) = self.discovery_error.take() {
+                self.status.push_str(&format!("; cmux discovery failed: {error}"));
+            }
         }
     }
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal, rx: &Receiver<(usize, Repo)>) -> Result<()> {
         loop {
+            if let Some(discovery) = &self.discovery {
+                match discovery.try_recv() {
+                    Ok(result) => self.finish_discovery(result),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.finish_discovery(Err(anyhow::anyhow!("discovery worker stopped")));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
             while let Ok((i, repo)) = rx.try_recv() {
                 self.receive(i, repo);
             }
@@ -627,10 +689,11 @@ mod tests {
     fn app() -> (App, Receiver<(usize, Repo)>) {
         let (tx, rx) = mpsc::channel();
         let target = Target {
+            common_dir: repo(&[]).path,
             worktrees: vec![repo(&[]).path],
             workspace: None,
         };
-        (App::new(vec![target], true, tx), rx)
+        (App::new(vec![target], true, false, tx), rx)
     }
 
     #[test]
@@ -669,6 +732,41 @@ mod tests {
         assert_eq!(app.branch(app.selected.unwrap()).unwrap().1.name, "feature");
         app.receive(0, repo(&["main"]));
         assert!(app.selected.is_none());
+    }
+
+    #[test]
+    fn cmux_discovery_updates_worktrees_and_appends_new_repos() {
+        let (mut app, rx) = app();
+        app.receive(0, repo(&["main"]));
+        app.selected = Some((0, 0));
+        let common_dir = app.targets[0].common_dir.clone();
+        let worktree = common_dir.join("worktree");
+        let new_repo = common_dir.join("new-repo");
+
+        app.finish_discovery(Ok(vec![
+            Target {
+                common_dir: new_repo.clone(),
+                worktrees: vec![new_repo.clone()],
+                workspace: None,
+            },
+            Target {
+                common_dir,
+                worktrees: vec![worktree.clone()],
+                workspace: None,
+            },
+        ]));
+
+        assert_eq!(app.targets.len(), 2);
+        assert_eq!(app.targets[0].worktrees, vec![worktree]);
+        assert_eq!(app.targets[1].worktrees, vec![new_repo]);
+        assert_eq!(app.entries(), vec![(0, 0)]);
+        assert_eq!(app.selected, Some((0, 0)));
+        assert_eq!(app.pending, vec![true, true]);
+        let mut scanned: Vec<_> = (0..2)
+            .map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap().0)
+            .collect();
+        scanned.sort_unstable();
+        assert_eq!(scanned, vec![0, 1]);
     }
 
     #[test]

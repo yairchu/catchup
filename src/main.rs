@@ -25,6 +25,7 @@ Options:
 
 /// One repository to scan, with the cmux workspace it was found in.
 pub struct Target {
+    pub common_dir: PathBuf,
     pub worktrees: Vec<PathBuf>,
     pub workspace: Option<cmux::Workspace>,
 }
@@ -45,15 +46,12 @@ fn main() -> Result<()> {
             _ => dirs.push(PathBuf::from(arg)),
         }
     }
-    let found = if dirs.is_empty() {
-        cmux::workspace_dirs()?
-            .into_iter()
-            .flat_map(|(ws, dirs)| dirs.into_iter().map(move |d| (Some(ws.clone()), d)))
-            .collect()
+    let discover_cmux = dirs.is_empty();
+    let targets = if discover_cmux {
+        cmux_targets()?
     } else {
-        dirs.into_iter().map(|d| (None, d)).collect()
+        group(dirs.into_iter().map(|d| (None, d)).collect())
     };
-    let targets = group(found);
     if targets.is_empty() {
         anyhow::bail!("no git repositories found");
     }
@@ -75,8 +73,16 @@ fn main() -> Result<()> {
         tui::print(&repos.into_iter().flatten().collect::<Vec<_>>());
         Ok(())
     } else {
-        tui::run(targets, fetch, tx, rx)
+        tui::run(targets, fetch, discover_cmux, tx, rx)
     }
+}
+
+fn cmux_targets() -> Result<Vec<Target>> {
+    let found = cmux::workspace_dirs()?
+        .into_iter()
+        .flat_map(|(ws, dirs)| dirs.into_iter().map(move |d| (Some(ws.clone()), d)))
+        .collect();
+    Ok(group(found))
 }
 
 /// Groups directories by repository, keeping the order they were found in.
@@ -94,8 +100,9 @@ fn group(found: Vec<(Option<cmux::Workspace>, PathBuf)>) -> Vec<Target> {
                 }
             }
             None => {
-                by_common_dir.insert(common, targets.len());
+                by_common_dir.insert(common.clone(), targets.len());
                 targets.push(Target {
+                    common_dir: common,
                     worktrees: vec![toplevel],
                     workspace: ws,
                 });
