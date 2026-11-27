@@ -25,8 +25,8 @@ catchup --no-fetch  # skip fetching, only show what can be pulled
 | Key               | Action                                       |
 |-------------------|----------------------------------------------|
 | `↑` `↓` / `j` `k` | select                                       |
-| `⏎` / `o` / click | show the new commits                         |
-| `w`               | show them in a split in the repo's workspace |
+| `⏎` / `o` / click | open the current detail view                  |
+| `w`               | open it in a split in the repo's workspace   |
 | `d`               | toggle range-diff and fetched commits        |
 | `[` / `]`         | scroll the detail pane                       |
 | `p` / `P`         | pull the selected branch / all branches      |
@@ -45,6 +45,8 @@ range-diff summary from local to upstream, even when the latest fetch brought
 in no commits. Press `d` to switch to the fetched commits. Catchup shows the
 fetched commits automatically if either side contains a merge in the
 diverged history or Git cannot produce the comparison.
+Opening the range-diff shows the full comparison in glog, or in Git's pager
+if glog is unavailable or lacks range-diff support.
 
 ## License
 

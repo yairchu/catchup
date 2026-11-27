@@ -68,6 +68,12 @@ impl Branch {
         !self.commits.is_empty() || self.rewritten || self.local.as_ref().is_some_and(|l| l.behind > 0)
     }
 
+    pub fn range_diff_range(&self) -> Option<String> {
+        let local = self.local.as_ref()?;
+        local.range_diff.as_ref()?;
+        Some(format!("{}...{}", local.sha, self.new.as_deref()?))
+    }
+
     /// Revisions for `git log` showing what is new on this branch.
     pub fn log_range(&self) -> Option<Vec<String>> {
         let new = short(self.new.as_deref()?);

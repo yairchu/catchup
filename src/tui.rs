@@ -328,13 +328,9 @@ impl App {
         let Some((repo, branch)) = self.selected.and_then(|k| self.branch(k)) else {
             return Action::None;
         };
-        let Some(range) = branch.log_range() else {
+        let Some((mut program, range)) = open_program(branch, self.show_fetched) else {
             self.status = "nothing to show".into();
             return Action::None;
-        };
-        let mut program = match on_path("glog") {
-            true => vec!["glog", "log", "--exit-on-esc"],
-            false => vec!["git", "log", "-p"],
         };
         program.extend(range.iter().map(String::as_str));
         if !in_workspace {
@@ -524,7 +520,7 @@ impl App {
             Style::new().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED)
         };
         f.render_widget(Paragraph::new(Span::styled("r Refresh", style)), refresh);
-        let keys = "↑↓ select  ⏎ log  w log in its workspace  p pull  P pull all  q quit";
+        let keys = "↑↓ select  ⏎ open  w open in workspace  p pull  P pull all  q quit";
         let footer_text = if self.status.is_empty() {
             Line::from(keys.fg(MUTED))
         } else {
@@ -694,6 +690,32 @@ pub fn print(repos: &[Repo]) {
     }
 }
 
+fn open_program(branch: &Branch, show_fetched: bool) -> Option<(Vec<&'static str>, Vec<String>)> {
+    let has_glog = on_path("glog");
+    if let Some(range) = branch.range_diff_range().filter(|_| !show_fetched) {
+        let has_range_diff = has_glog
+            && Command::new("glog").arg("--help").output().is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| line.split_whitespace().next() == Some("range-diff"))
+            });
+        let program = if has_range_diff {
+            vec!["glog", "range-diff", "--no-notes", "--patch"]
+        } else {
+            vec!["git", "--paginate", "range-diff", "--no-notes", "--patch"]
+        };
+        return Some((program, vec![range]));
+    }
+    let range = branch.log_range()?;
+    let program = if has_glog {
+        vec!["glog", "log", "--exit-on-esc"]
+    } else {
+        vec!["git", "log", "-p"]
+    };
+    Some((program, range))
+}
+
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
@@ -772,6 +794,7 @@ mod tests {
     fn diverged_detail_toggles_between_range_diff_and_fetched_commits() {
         let (mut app, _) = app();
         let mut repo = repo(&["main"]);
+        repo.branches[0].new = Some("upstream".into());
         repo.branches[0].local = Some(scan::Local {
             sha: "local".into(),
             checked_out_in: None,
@@ -788,8 +811,20 @@ mod tests {
         };
 
         assert!(detail_text(&mut app).contains("Rewritten patch"));
+        let open_args = |app: &mut App| {
+            let Action::Foreground(cmd) = app.on_key(KeyCode::Enter) else {
+                panic!("expected a foreground viewer");
+            };
+            cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>()
+        };
+        let args = open_args(&mut app);
+        assert!(args.iter().any(|arg| arg == "range-diff"));
+        assert_eq!(args.last().unwrap(), "local...upstream");
         app.on_key(KeyCode::Char('d'));
         assert!(detail_text(&mut app).contains("Nothing new in this fetch."));
+        let args = open_args(&mut app);
+        assert_eq!(args[0], "log");
+        assert_eq!(args.last().unwrap(), "local..upstream");
         app.on_key(KeyCode::Char('d'));
         assert!(detail_text(&mut app).contains("Rewritten patch"));
     }
