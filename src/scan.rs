@@ -55,6 +55,7 @@ pub struct Local {
     pub checked_out_in: Option<PathBuf>,
     pub ahead: usize,
     pub behind: usize,
+    pub range_diff: Option<String>,
 }
 
 impl Branch {
@@ -290,20 +291,33 @@ pub fn refresh_local(dir: &Path, branches: &mut [Branch]) {
     for b in branches {
         let local_ref = format!("refs/heads/{}", b.name);
         b.local = rev(dir, &local_ref).map(|sha| {
-            let counts = query(
-                dir,
-                &["rev-list", "--left-right", "--count", &format!("{local_ref}...{}", b.remote_ref)],
-            )
-            .unwrap_or_default();
+            let symmetric = b.new.as_ref().map(|upstream| format!("{sha}...{upstream}"));
+            let counts = symmetric
+                .as_deref()
+                .and_then(|range| query(dir, &["rev-list", "--left-right", "--count", range]))
+                .unwrap_or_default();
             let mut counts = counts.split_whitespace().map(|n| n.parse().unwrap_or(0));
+            let ahead = counts.next().unwrap_or(0);
+            let behind = counts.next().unwrap_or(0);
             Local {
                 sha,
                 checked_out_in: checkouts.get(&b.name).cloned(),
-                ahead: counts.next().unwrap_or(0),
-                behind: counts.next().unwrap_or(0),
+                ahead,
+                behind,
+                range_diff: symmetric
+                    .filter(|_| ahead > 0 && behind > 0)
+                    .and_then(|range| range_diff(dir, &range)),
             }
         });
     }
+}
+
+fn range_diff(dir: &Path, range: &str) -> Option<String> {
+    // Range-diff normally omits merges, which can hide changes in either series.
+    if !git(dir, &["rev-list", "--merges", "--max-count=1", range]).ok()?.is_empty() {
+        return None;
+    }
+    query(dir, &["range-diff", "--no-color", "--no-patch", "--no-notes", range])
 }
 
 /// Fast-forwards the local branch to its remote-tracking branch, never merging.
@@ -411,6 +425,7 @@ mod tests {
         assert_eq!(repo.branches[0].commits[0].subject, "second discovery");
         assert_eq!(repo.branches[0].old, first_tip);
         assert_eq!(repo.branches[0].local.as_ref().unwrap().behind, 2);
+        assert!(repo.branches[0].local.as_ref().unwrap().range_diff.is_none());
         let range = repo.branches[0].log_range().unwrap();
         assert_eq!(
             git(&consumer, &["rev-list", "--count", &range[0]]).unwrap(),
@@ -453,9 +468,13 @@ mod tests {
         assert!(repo.branches[0].rewritten);
         assert_eq!(repo.branches[0].commits.len(), 1);
         assert_eq!(repo.branches[0].commits[0].subject, "replacement");
+        let diff = repo.branches[0].local.as_ref().unwrap().range_diff.as_ref().unwrap();
+        assert!(diff.lines().any(|line| line.contains(" < ") && line.ends_with("second discovery")));
+        assert!(diff.lines().any(|line| line.contains(" > ") && line.ends_with("replacement")));
         let repo = scan(&worktrees, true);
         assert!(!repo.branches[0].rewritten);
         assert!(repo.branches[0].commits.is_empty());
+        assert_eq!(repo.branches[0].local.as_ref().unwrap().range_diff.as_ref(), Some(diff));
         assert!(
             repo.branches[0].interesting(),
             "diverged branches remain visible"
@@ -485,5 +504,19 @@ mod tests {
             repo.error.is_none(),
             "a successful refresh clears fetch errors"
         );
+
+        git(&producer, &["switch", "-c", "side", &baseline]).unwrap();
+        commit(&producer, "side change");
+        git(&producer, &["switch", "main"]).unwrap();
+        git(&producer, &[
+            "-c", "user.name=Catchup Test", "-c", "user.email=test@example.com",
+            "-c", "commit.gpgsign=false", "merge", "--no-edit", "side",
+        ]).unwrap();
+        let repo = scan(&worktrees, true);
+        let branch = &repo.branches[0];
+        let local = branch.local.as_ref().unwrap();
+        assert!(local.ahead > 0 && local.behind > 0);
+        assert!(local.range_diff.is_none());
+        assert!(branch.commits.iter().any(|commit| commit.subject == "side change"));
     }
 }

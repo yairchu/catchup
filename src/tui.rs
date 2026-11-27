@@ -28,6 +28,8 @@ struct App {
     selected: Option<Key>,
     status: String,
     scroll: usize,
+    show_fetched: bool,
+    detail_scroll: usize,
     list_area: Rect,
     refresh_area: Rect,
     fetch: bool,
@@ -93,6 +95,8 @@ impl App {
             selected: None,
             status: String::new(),
             scroll: 0,
+            show_fetched: false,
+            detail_scroll: 0,
             list_area: Rect::default(),
             refresh_area: Rect::default(),
             line_keys: Vec::new(),
@@ -164,7 +168,7 @@ impl App {
     fn receive(&mut self, i: usize, repo: Repo) {
         // Branch order can change when a worktree switches branches.
         if let Some((r, b)) = self.selected.filter(|(r, _)| *r == i) {
-            self.selected = self.repos[r]
+            let selected = self.repos[r]
                 .as_ref()
                 .and_then(|old| old.branches.get(b))
                 .and_then(|old| {
@@ -173,6 +177,11 @@ impl App {
                     })
                 })
                 .map(|b| (r, b));
+            if selected.is_some() {
+                self.selected = selected;
+            } else {
+                self.select(None);
+            }
         }
         self.repos[i] = Some(repo);
         self.pending[i] = false;
@@ -210,7 +219,7 @@ impl App {
                 self.receive(i, repo);
             }
             if self.selected.is_none_or(|k| !self.entries().contains(&k)) {
-                self.selected = self.entries().first().copied();
+                self.select(self.entries().first().copied());
             }
             terminal.draw(|f| self.draw(f))?;
             if !event::poll(Duration::from_millis(100))? {
@@ -256,6 +265,18 @@ impl App {
             KeyCode::Char('p') => self.pull_selected(),
             KeyCode::Char('P') => self.pull_all(),
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('d') => {
+                if self.selected
+                    .and_then(|k| self.branch(k))
+                    .and_then(|(_, b)| b.local.as_ref())
+                    .is_some_and(|local| local.range_diff.is_some())
+                {
+                    self.show_fetched = !self.show_fetched;
+                    self.detail_scroll = 0;
+                }
+            }
+            KeyCode::Char('[') => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+            KeyCode::Char(']') => self.detail_scroll = self.detail_scroll.saturating_add(1),
             _ => {}
         }
         Action::None
@@ -274,7 +295,7 @@ impl App {
         match self.line_keys.get(line).copied().flatten() {
             Some(key) if Some(key) == self.selected => self.open(false),
             Some(key) => {
-                self.selected = Some(key);
+                self.select(Some(key));
                 Action::None
             }
             None => Action::None,
@@ -287,7 +308,15 @@ impl App {
             return;
         };
         let pos = pos.saturating_add_signed(delta).min(entries.len() - 1);
-        self.selected = Some(entries[pos]);
+        self.select(Some(entries[pos]));
+    }
+
+    fn select(&mut self, selected: Option<Key>) {
+        if self.selected != selected {
+            self.selected = selected;
+            self.show_fetched = false;
+            self.detail_scroll = 0;
+        }
     }
 
     fn branch(&self, (r, b): Key) -> Option<(&Repo, &Branch)> {
@@ -504,7 +533,7 @@ impl App {
         f.render_widget(Paragraph::new(footer_text), footer);
     }
 
-    fn draw_detail(&self, f: &mut Frame, area: Rect) {
+    fn draw_detail(&mut self, f: &mut Frame, area: Rect) {
         let Some((repo, branch)) = self.selected.and_then(|k| self.branch(k)) else {
             f.render_widget(Block::default().borders(Borders::TOP), area);
             return;
@@ -516,19 +545,36 @@ impl App {
             text.push(note.clone().yellow().into());
         }
         if branch.rewritten {
-            text.push("Force-pushed: showing commits new in this fetch.".red().into());
+            text.push("Force-pushed in this fetch.".red().into());
         }
-        if branch.commits.is_empty() {
-            if let Some(l) = branch.local.as_ref().filter(|l| l.behind > 0) {
-                text.push(
-                    format!("Nothing new in this fetch; {} commits fetched earlier are not pulled yet.", l.behind)
-                        .fg(MUTED)
-                        .into(),
-                );
+        let range_diff = branch.local.as_ref().and_then(|local| local.range_diff.as_deref());
+        if let Some(diff) = range_diff.filter(|_| !self.show_fetched) {
+            text.push("Range-diff (local → upstream)  d fetched commits  [ ] scroll".fg(MUTED).into());
+            text.extend(diff.lines().map(|line| Line::from(line.to_owned())));
+        } else {
+            if range_diff.is_some() {
+                text.push("Fetched commits  d range-diff  [ ] scroll".fg(MUTED).into());
+            } else if branch.local.as_ref().is_some_and(|local| local.ahead > 0 && local.behind > 0) {
+                text.push("Range-diff unavailable. Showing fetched commits.".fg(MUTED).into());
             }
+            if branch.commits.is_empty() {
+                if let Some(l) = branch.local.as_ref().filter(|l| l.behind > 0) {
+                    text.push(
+                        format!("Nothing new in this fetch. {} upstream commits are missing locally.", l.behind)
+                            .fg(MUTED)
+                            .into(),
+                    );
+                }
+            }
+            text.extend(branch.commits.iter().map(commit_line));
         }
-        text.extend(branch.commits.iter().map(commit_line));
-        f.render_widget(Paragraph::new(text).block(block).wrap(Wrap { trim: false }), area);
+        self.detail_scroll = self.detail_scroll.min(text.len().saturating_sub(1));
+        f.render_widget(
+            Paragraph::new(text.into_iter().skip(self.detail_scroll).collect::<Vec<_>>())
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
     }
 }
 
@@ -720,6 +766,32 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).unwrap();
         assert_eq!(row(&terminal, 2), "nothing new: ~/one, ~/two, ~/three");
         assert_eq!(row(&terminal, 3), "");
+    }
+
+    #[test]
+    fn diverged_detail_toggles_between_range_diff_and_fetched_commits() {
+        let (mut app, _) = app();
+        let mut repo = repo(&["main"]);
+        repo.branches[0].local = Some(scan::Local {
+            sha: "local".into(),
+            checked_out_in: None,
+            ahead: 1,
+            behind: 1,
+            range_diff: Some("1: abc ! 1: def Rewritten patch".into()),
+        });
+        app.receive(0, repo);
+        app.select(Some((0, 0)));
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let mut detail_text = |app: &mut App| {
+            terminal.draw(|frame| app.draw_detail(frame, frame.area())).unwrap();
+            terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>()
+        };
+
+        assert!(detail_text(&mut app).contains("Rewritten patch"));
+        app.on_key(KeyCode::Char('d'));
+        assert!(detail_text(&mut app).contains("Nothing new in this fetch."));
+        app.on_key(KeyCode::Char('d'));
+        assert!(detail_text(&mut app).contains("Rewritten patch"));
     }
 
     #[test]

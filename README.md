@@ -27,6 +27,8 @@ catchup --no-fetch  # skip fetching, only show what can be pulled
 | `↑` `↓` / `j` `k` | select                                       |
 | `⏎` / `o` / click | show the new commits                         |
 | `w`               | show them in a split in the repo's workspace |
+| `d`               | toggle range-diff and fetched commits        |
+| `[` / `]`         | scroll the detail pane                       |
 | `p` / `P`         | pull the selected branch / all branches      |
 | `r` / Refresh     | refresh all listed repos                     |
 | `q`               | quit                                         |
@@ -37,6 +39,12 @@ also adds repositories opened in cmux since the last scan. With `--no-fetch`,
 it rescans without fetching.
 Click Refresh in the footer or press `r`; wait for a repo's refresh to finish
 before pulling it.
+
+When a local branch and its upstream diverge, the detail pane shows a
+range-diff summary from local to upstream, even when the latest fetch brought
+in no commits. Press `d` to switch to the fetched commits. Catchup shows the
+fetched commits automatically if either side contains a merge in the
+diverged history or Git cannot produce the comparison.
 
 ## License
 
