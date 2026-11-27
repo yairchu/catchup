@@ -693,18 +693,19 @@ pub fn print(repos: &[Repo]) {
 fn open_program(branch: &Branch, show_fetched: bool) -> Option<(Vec<&'static str>, Vec<String>)> {
     let has_glog = on_path("glog");
     if let Some(range) = branch.range_diff_range().filter(|_| !show_fetched) {
-        let has_range_diff = has_glog
-            && Command::new("glog").arg("--help").output().is_ok_and(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout)
-                        .lines()
-                        .any(|line| line.split_whitespace().next() == Some("range-diff"))
-            });
-        let program = if has_range_diff {
-            vec!["glog", "range-diff", "--no-notes", "--patch"]
-        } else {
-            vec!["git", "--paginate", "range-diff", "--no-notes", "--patch"]
-        };
+        let help = has_glog
+            .then(|| Command::new("glog").args(["range-diff", "--help"]).output().ok())
+            .flatten()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+        let mut program = vec!["git", "--paginate", "range-diff"];
+        if let Some(help) = help.filter(|help| help.starts_with("Usage: glog range-diff ")) {
+            program = vec!["glog", "range-diff"];
+            if help.lines().any(|line| line.split_whitespace().next() == Some("--exit-on-esc")) {
+                program.push("--exit-on-esc");
+            }
+        }
+        program.extend(["--no-notes", "--patch"]);
         return Some((program, vec![range]));
     }
     let range = branch.log_range()?;

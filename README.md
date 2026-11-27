@@ -46,7 +46,8 @@ in no commits. Press `d` to switch to the fetched commits. Catchup shows the
 fetched commits automatically if either side contains a merge in the
 diverged history or Git cannot produce the comparison.
 Opening the range-diff shows the full comparison in glog, or in Git's pager
-if glog is unavailable or lacks range-diff support.
+if glog is unavailable or lacks range-diff support. Press Escape to return
+to Catchup when your glog supports `--exit-on-esc` for range-diff.
 
 ## License
 
